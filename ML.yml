@@ -1,0 +1,15 @@
+name: ML
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - pandas
+  - scikit-learn
+  - ipykernel
+  - matplotlib
+  - seaborn
+  - pypdf2
+  - nltk
+  - cvxopt
+  - tensorflow
+prefix: /opt/anaconda3/envs/ML
