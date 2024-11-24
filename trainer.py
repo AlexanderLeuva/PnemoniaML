@@ -58,6 +58,7 @@ class TrainingConfig:
         self.epochs = 5
         self.pos_weight =  1.0 # these weights are important in combinatgion to determine gradietn.
         self.neg_weight = 3.0
+        self.drop_out = [0.3, 0.2, 0.1]
 
 class MetricsTracker:
     """Class to track and compute various metrics during training, for one epoch"""
@@ -108,204 +109,218 @@ class MetricsTracker:
             'precision - 0': self.TN / (self.TN + self.FN +1e-8)
         }
 
+class Trainer():
+    def __init__(self, model, model_config):
+        self.history = {'val': [], 'train': [], 'test': []}
+        self.model = model
+        self.config = model_config
 
-history = {'val': [], 'train': [], 'test': []}
-# decorate by adding the performance to the metrics array - convergence graphs show --> what is the optimal place to stop training epochs?
-@add_performance_logging(logger, logging.INFO, history, type = 'train')
-def train_one_epoch(
-    dataloader: DataLoader,
-    model: nn.Module,
-    loss_fn: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    epoch: int,
-    total_epochs: int
-) -> Dict[str, float]:
-    """Train model for one epoch and return metrics"""
-    model.train()
-    metrics = MetricsTracker(epoch)
+        weights = torch.tensor([self.config.neg_weight, self.config.pos_weight]).to(DEVICE)
+        self.loss_fn = nn.CrossEntropyLoss(weight=weights)
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=self.config.learning_rate)     
 
-    difficult_cases = []
-    
-    for idx, batch in enumerate(dataloader):
-        X = batch["images"].to(DEVICE)
-        y = batch["labels"].to(DEVICE)
         
-        # Forward pass and loss calculation
-        pred = model(X)
-        loss = loss_fn(pred, y)
+    @add_performance_logging(logger, logging.INFO, type = 'train')
+    def train_one_epoch(self, 
+        dataloader: DataLoader,
+        epoch: int,
+    ) -> Dict[str, float]:
+        """Train model for one epoch and return metrics"""
+        self.model.train()
+        metrics = MetricsTracker(epoch)
+
+        difficult_cases = []
         
-        # Get all of the current images wrong.
-        if epoch >= 4:
-            predictions = pred.argmax(1)
-            incorrect_mask = predictions != y
-            if incorrect_mask.any():
-                difficult_cases.extend([{
-                    'image': X[i],
-                    'true_label': y[i].item(),
-                    'predicted': predictions[i].item(),
-                    'loss': loss.item()
-                } for i in range(len(y)) if incorrect_mask[i]])
+        for idx, batch in enumerate(dataloader):
+            X = batch["images"].to(DEVICE)
+            y = batch["labels"].to(DEVICE)
+            
+            # Forward pass and loss calculation
+            pred = self.model(X)
+            loss = self.loss_fn(pred, y)
+            
+            # Get all of the current images wrong.
+            if epoch >= 4:
+                predictions = pred.argmax(1)
+                incorrect_mask = predictions != y
+                if incorrect_mask.any():
+                    difficult_cases.extend([{
+                        'image': X[i],
+                        'true_label': y[i].item(),
+                        'predicted': predictions[i].item(),
+                        'loss': loss.item()
+                    } for i in range(len(y)) if incorrect_mask[i]])
 
 
 
 
-        # Backpropagaion
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # Backpropagaion
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            
+            # Update metrics
+            metrics.update(pred, y, loss.item())
+
+        if epoch >= 4 and difficult_cases:
+            difficult_cases.sort(key=lambda x: x['loss'], reverse=True)
+            num_to_keep = int(len(dataloader.dataset) * 0.15)
+            return metrics.get_epoch_stats(len(dataloader)), difficult_cases[:num_to_keep]
+            
+            
+            #if idx % 5 == 0:
+        #     _log_batch_stats(epoch, total_epochs, idx, X, y, pred, loss, len(dataloader.dataset))
         
-        # Update metrics
-        metrics.update(pred, y, loss.item())
+        return metrics.get_epoch_stats(len(dataloader)), None
 
-    if epoch >= 4 and difficult_cases:
-        difficult_cases.sort(key=lambda x: x['loss'], reverse=True)
-        num_to_keep = int(len(dataloader.dataset) * 0.15)
-        return metrics.get_epoch_stats(len(dataloader)), difficult_cases[:num_to_keep]
+    def train(self, train_dataloader, val_dataloader):
+
+        difficult_cases = []
+        # Training loop
+        for epoch in range(self.config.epochs):
+            metrics, hard_cases = self.train_one_epoch(train_dataloader, epoch)
+            # Evaluation
+            if hard_cases:
+                difficult_cases = hard_cases 
+            self.evaluate_model(val_dataloader)
+
+ 
+    @add_performance_logging(logger, logging.INFO, type = 'val')
+    def evaluate_model(self,
+        dataloader: DataLoader,
+    ) -> Tuple[float, float, np.ndarray, np.ndarray]:
+        """Evaluate model and return test metrics and predictions"""
+        self.model.eval()
+        metrics = MetricsTracker()
+        all_probs = []
+        all_labels = []
         
+        with torch.no_grad():
+            for batch in dataloader:
+                images = batch["images"].to(DEVICE)
+                labels = batch["labels"].to(DEVICE)
+                
+                pred = self.model(images)
+                loss = self.loss_fn(pred, labels)
+                
+                probs = torch.softmax(pred, dim=1)[:, 1]
+                all_probs.extend(probs.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                
+                metrics.update(pred, labels, loss.item())
         
-        #if idx % 5 == 0:
-       #     _log_batch_stats(epoch, total_epochs, idx, X, y, pred, loss, len(dataloader.dataset))
-    
-    return metrics.get_epoch_stats(len(dataloader)), None
 
-@add_performance_logging(logger, logging.INFO, history, type = 'val')
-def evaluate_model(
-    dataloader: DataLoader,
-    model: nn.Module,
-    loss_fn: nn.Module
-) -> Tuple[float, float, np.ndarray, np.ndarray]:
-    """Evaluate model and return test metrics and predictions"""
-    model.eval()
-    metrics = MetricsTracker()
-    all_probs = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch in dataloader:
-            images = batch["images"].to(DEVICE)
-            labels = batch["labels"].to(DEVICE)
-            
-            pred = model(images)
-            loss = loss_fn(pred, labels)
-            
-            probs = torch.softmax(pred, dim=1)[:, 1]
-            all_probs.extend(probs.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            
-            metrics.update(pred, labels, loss.item())
-    
+        return metrics.get_epoch_stats(len(dataloader)), None # this is messy and will change later for the hard cases.
 
-    return metrics.get_epoch_stats(len(dataloader)), None # this is messy and will change later for the hard cases.
+    def calculate_metrics(self,
+        probs: np.ndarray,
+        labels: np.ndarray,
+        threshold: float = 0.5
+    ) -> Dict[str, float]:
+        """Calculate classification metrics at given threshold"""
+        predictions = (probs >= threshold).astype(int)
+        return {
+            'precision': precision_score(labels, predictions),
+            'recall': recall_score(labels, predictions),
+            'class_0_precision': precision_score(labels == 0, predictions == 0),
+            'class_0_recall': recall_score(labels == 0, predictions == 0),
+            'class_1_precision': precision_score(labels == 1, predictions == 1),
+            'class_1_recall': recall_score(labels == 1, predictions == 1)
+        }
 
-def calculate_metrics(
-    probs: np.ndarray,
-    labels: np.ndarray,
-    threshold: float = 0.5
-) -> Dict[str, float]:
-    """Calculate classification metrics at given threshold"""
-    predictions = (probs >= threshold).astype(int)
-    return {
-        'precision': precision_score(labels, predictions),
-        'recall': recall_score(labels, predictions),
-        'class_0_precision': precision_score(labels == 0, predictions == 0),
-        'class_0_recall': recall_score(labels == 0, predictions == 0),
-        'class_1_precision': precision_score(labels == 1, predictions == 1),
-        'class_1_recall': recall_score(labels == 1, predictions == 1)
-    }
+    def plot_metrics(self,
+        probs: np.ndarray,
+        labels: np.ndarray,
+        thresholds: np.ndarray
+    ) -> None:
+        """Plot PR curve and calibration curve"""
+        # PR curve
+        precisions, recalls, _ = precision_recall_curve(labels, probs)
+        ap = average_precision_score(labels, probs)
+        
+        plt.figure(figsize=(12, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(recalls, precisions, label=f'PR curve (AP={ap:.3f})')
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title('Precision-Recall Curve')
+        plt.legend()
+        plt.grid(True)
+        
+        # Calibration curve
+        prob_true, prob_pred = calibration_curve(labels, probs, n_bins=10)
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(prob_pred, prob_true)
+        plt.plot([0, 1], [0, 1], '--')
+        plt.xlabel('Predicted probability')
+        plt.ylabel('True probability')
+        plt.title('Calibration curve')
+        
+        plt.tight_layout()
+        plt.show()
+    def evaluate_difficulties(self, model, dataloader):
+        difficulties = {}
+        model.eval()
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                X = batch['images'].to(DEVICE)
+                y = batch['labels'].to(DEVICE)
+                indices = batch['ids']  # Original dataset indices
+                
+                pred = model(X)
+                predictions = pred.argmax(1)
+                incorrect_mask = predictions != y
+                
+                for i, idx in enumerate(indices):
+                    difficulties[idx] = 3.0 if incorrect_mask[i] else 1
+        
+        return difficulties
 
-def plot_metrics(
-    probs: np.ndarray,
-    labels: np.ndarray,
-    thresholds: np.ndarray
-) -> None:
-    """Plot PR curve and calibration curve"""
-    # PR curve
-    precisions, recalls, _ = precision_recall_curve(labels, probs)
-    ap = average_precision_score(labels, probs)
-    
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(recalls, precisions, label=f'PR curve (AP={ap:.3f})')
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title('Precision-Recall Curve')
-    plt.legend()
-    plt.grid(True)
-    
-    # Calibration curve
-    prob_true, prob_pred = calibration_curve(labels, probs, n_bins=10)
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(prob_pred, prob_true)
-    plt.plot([0, 1], [0, 1], '--')
-    plt.xlabel('Predicted probability')
-    plt.ylabel('True probability')
-    plt.title('Calibration curve')
-    
-    plt.tight_layout()
-    plt.show()
-def evaluate_difficulties(model, dataloader):
-    difficulties = {}
-    model.eval()
-    
-    with torch.no_grad():
-        for batch in dataloader:
-            X = batch['images'].to(DEVICE)
-            y = batch['labels'].to(DEVICE)
-            indices = batch['ids']  # Original dataset indices
-            
-            pred = model(X)
-            predictions = pred.argmax(1)
-            incorrect_mask = predictions != y
-            
-            for i, idx in enumerate(indices):
-                difficulties[idx] = 3.0 if incorrect_mask[i] else 1
-    
-    return difficulties
-
-def evaluate_test_set(model, test_dataloader, device):
-    """
-    Evaluate model on test set and return predictions and true labels.
-    
-    Args:
-        model: PyTorch model
-        test_dataloader: DataLoader for test set
-        device: Device to run evaluation on
-    
-    Returns:
-        dict: Contains probabilities, true labels, and metrics
-    """
-    model.eval()
-    test_probs = []
-    test_labels = []
-    
-    with torch.no_grad():
-        for batch in test_dataloader:
-            inputs, labels = batch['images'], batch['labels']
-            
+    def evaluate_test_set(self, model, test_dataloader, device):
+        """
+        Evaluate model on test set and return predictions and true labels.
+        
+        Args:
+            model: PyTorch model
+            test_dataloader: DataLoader for test set
+            device: Device to run evaluation on
+        
+        Returns:
+            dict: Contains probabilities, true labels, and metrics
+        """
+        model.eval()
+        test_probs = []
+        test_labels = []
+        
+        with torch.no_grad():
+            for batch in test_dataloader:
+                inputs, labels = batch['images'], batch['labels']
+                
 
 
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            
-            outputs = model(inputs)
-            probs = torch.softmax(outputs, dim=1)
-            
-            test_probs.extend(probs.cpu().numpy()[:, 1])
-            test_labels.extend(labels.cpu().numpy())
-    
-    test_probs = np.array(test_probs)
-    test_labels = np.array(test_labels)
-    
-    # Calculate metrics
-    test_metrics = calculate_metrics(test_probs, test_labels)
-    
-    return {
-        'probabilities': test_probs,
-        'true_labels': test_labels,
-        'metrics': test_metrics
-    }
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                
+                outputs = model(inputs)
+                probs = torch.softmax(outputs, dim=1)
+                
+                test_probs.extend(probs.cpu().numpy()[:, 1])
+                test_labels.extend(labels.cpu().numpy())
+        
+        test_probs = np.array(test_probs)
+        test_labels = np.array(test_labels)
+        
+        # Calculate metrics
+        test_metrics = self.calculate_metrics(test_probs, test_labels)
+        
+        return {
+            'probabilities': test_probs,
+            'true_labels': test_labels,
+            'metrics': test_metrics
+        }
 
 def main():
     # Load configuration
@@ -358,28 +373,14 @@ def main():
     """
     model = ResNetCXR( 
         num_classes=2,
-        dropout_rate=0.3).to(DEVICE)
+        dropout_rate=config.drop_out).to(DEVICE)
     
-    
+    trainer = Trainer(model, config) 
     # Setup training
-    weights = torch.tensor([config.neg_weight, config.pos_weight]).to(DEVICE)
-    loss_fn = nn.CrossEntropyLoss(weight=weights)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    trainer.train(train_dataloader, val_dataloader)
 
-
-    difficult_cases = []
-    # Training loop
-    for epoch in range(config.epochs):
-        metrics, hard_cases = train_one_epoch(train_dataloader, model, loss_fn, optimizer, epoch, config.epochs)
-        # Evaluation
-        if hard_cases:
-            difficult_cases = hard_cases 
-        evaluate_model(val_dataloader, model, loss_fn)
-
-        # these functions return objects, but as they are decorated they allow to abstradct away deatail and emphasize the fucntion they do
-
-   
-    difficulties = evaluate_difficulties(model, train_dataloader)
+    return
+    difficulties = trainer.evaluate_difficulties(model, train_dataloader)
     sampler = WeightedRandomSampler(
         [difficulties[x['id']] for x in train_dataset],
         num_samples=len(train_dataset)

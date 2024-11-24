@@ -14,11 +14,11 @@ without ever having to read the code.
 
 
 # note that this function returns a ocnsistent metrics object that I should use
-def add_performance_logging(logger, level, history, type = 'train'): 
+def add_performance_logging(logger, level, type = 'train'): 
     def decorator(func): 
         @functools.wraps(func)
-        def new_function(*args, **kwargs):
-            metrics, hard_cases = func(*args, **kwargs) 
+        def new_function(self, *args, **kwargs):
+            metrics, hard_cases = func(self, *args, **kwargs) 
 
             message = f'''
             Epoch {metrics['epoch'] if type == 'train' else type} Summary:
@@ -34,7 +34,7 @@ def add_performance_logging(logger, level, history, type = 'train'):
         
 
             logger.log(level, message)
-            history[type].append(metrics)
+            self.history[type].append(metrics)
 
 
             return metrics, hard_cases
